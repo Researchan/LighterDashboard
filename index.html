@@ -130,6 +130,8 @@
         const lighterFundingData = {};
         const lastValidLighterData = {}; // Store last valid Lighter orderbook data
         const lastValidBinanceData = {}; // Store last valid Binance data
+        const symbolLastUpdate = {}; // Track last update time for each symbol
+        const symbolSubscriptionStatus = {}; // Track subscription status per symbol
         let lighterMarkets = {};
         let binanceSymbolMap = {};
         
@@ -148,7 +150,8 @@
             if (!lighterOrderbooks[symbol]) {
                 lighterOrderbooks[symbol] = {
                     bids: new Map(), // price -> size
-                    asks: new Map()  // price -> size
+                    asks: new Map(),  // price -> size
+                    lastUpdate: Date.now()
                 };
             }
         }
@@ -214,12 +217,16 @@
                     }
                 });
             }
+            
+            // Update last update time
+            orderbook.lastUpdate = Date.now();
+            symbolLastUpdate[symbol] = Date.now();
         }
 
         // Get best bid/ask from maintained orderbook
         function getBestPrices(symbol) {
             const orderbook = lighterOrderbooks[symbol];
-            const MAX_AGE = 30000; // 30 seconds
+            const MAX_AGE = 60000; // Extend to 60 seconds for better persistence
             
             // Get highest bid
             let bestBid = null;
@@ -234,6 +241,7 @@
             }
             
             // Use last valid data if current data is unavailable but recent
+            // This helps maintain display during brief disconnections
             if ((!bestBid || !bestAsk) && lastValidLighterData[symbol]) {
                 const age = Date.now() - lastValidLighterData[symbol].timestamp;
                 if (age < MAX_AGE) {
@@ -374,6 +382,10 @@
                             channel: `order_book/${marketId}`
                         }));
                         
+                        // Mark subscription time
+                        symbolSubscriptionStatus[symbol] = Date.now();
+                        symbolLastUpdate[symbol] = Date.now(); // Initialize last update time
+                        
                         // Subscribe to market stats for funding rates with small delay
                         setTimeout(() => {
                             if (lighterWs.readyState === WebSocket.OPEN) {
@@ -406,18 +418,47 @@
                     const marketId = parseInt(data.channel.split(':')[1]);
                     const symbol = lighterMarkets[marketId];
                     
-                    if (symbol && binanceSymbolMap[symbol] && data.order_book) {
-                        // Apply incremental update
-                        applyOrderbookUpdate(
-                            symbol, 
-                            data.order_book.bids, 
-                            data.order_book.asks
-                        );
-                        
-                        // Validate and store orderbook data after update
-                        validateAndStoreOrderbook(symbol, true);
-                        
-                        scheduleUpdate();
+                    if (symbol && binanceSymbolMap[symbol]) {
+                        if (data.order_book) {
+                            // Apply incremental update
+                            applyOrderbookUpdate(
+                                symbol, 
+                                data.order_book.bids, 
+                                data.order_book.asks
+                            );
+                            
+                            // Validate and store orderbook data after update
+                            validateAndStoreOrderbook(symbol, true);
+                            
+                            scheduleUpdate();
+                        } else if (data.snapshot) {
+                            // Handle snapshot if provided
+                            initOrderbook(symbol);
+                            const orderbook = lighterOrderbooks[symbol];
+                            orderbook.bids.clear();
+                            orderbook.asks.clear();
+                            
+                            if (data.snapshot.bids) {
+                                data.snapshot.bids.forEach(bid => {
+                                    const price = parseFloat(bid.price);
+                                    const size = parseFloat(bid.size);
+                                    if (size > 0) orderbook.bids.set(price, size);
+                                });
+                            }
+                            
+                            if (data.snapshot.asks) {
+                                data.snapshot.asks.forEach(ask => {
+                                    const price = parseFloat(ask.price);
+                                    const size = parseFloat(ask.size);
+                                    if (size > 0) orderbook.asks.set(price, size);
+                                });
+                            }
+                            
+                            orderbook.lastUpdate = Date.now();
+                            symbolLastUpdate[symbol] = Date.now();
+                            validateAndStoreOrderbook(symbol, true);
+                            scheduleUpdate();
+                        }
                     }
                     
                 } else if (data.channel && data.channel.includes('market_stats')) {
@@ -450,6 +491,9 @@
                         asks: new Map(),
                         lastUpdate: Date.now()
                     };
+                    // Reset symbol tracking
+                    symbolLastUpdate[symbol] = 0;
+                    symbolSubscriptionStatus[symbol] = 0;
                 }
                 
                 setTimeout(() => {
@@ -458,7 +502,31 @@
             };
         }
         
-        // Monitor Lighter WebSocket health and send ping
+        // Function to resubscribe to a specific symbol
+        function resubscribeSymbol(marketId, symbol) {
+            if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
+                console.log(`Resubscribing to ${symbol} (market ${marketId})`);
+                
+                // Unsubscribe first
+                lighterWs.send(JSON.stringify({
+                    type: 'unsubscribe',
+                    channel: `order_book/${marketId}`
+                }));
+                
+                // Resubscribe after short delay
+                setTimeout(() => {
+                    if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
+                        lighterWs.send(JSON.stringify({
+                            type: 'subscribe',
+                            channel: `order_book/${marketId}`
+                        }));
+                        symbolSubscriptionStatus[symbol] = Date.now();
+                    }
+                }, 100);
+            }
+        }
+        
+        // Monitor Lighter WebSocket health and individual symbol status
         setInterval(() => {
             const now = Date.now();
             if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
@@ -469,7 +537,28 @@
                     console.error('Failed to send ping to Lighter:', e);
                 }
                 
-                // Check if we haven't received data for 10 seconds
+                // Check individual symbols for stale data
+                Object.keys(lighterMarkets).forEach(marketId => {
+                    const symbol = lighterMarkets[marketId];
+                    if (!binanceSymbolMap[symbol]) return;
+                    
+                    const lastUpdate = symbolLastUpdate[symbol] || 0;
+                    const timeSinceUpdate = now - lastUpdate;
+                    
+                    // If no update for 15 seconds, resubscribe
+                    if (timeSinceUpdate > 15000) {
+                        const lastResubscribe = symbolSubscriptionStatus[symbol] || 0;
+                        const timeSinceResubscribe = now - lastResubscribe;
+                        
+                        // Only resubscribe if we haven't tried in the last 10 seconds
+                        if (timeSinceResubscribe > 10000) {
+                            console.warn(`${symbol} orderbook stale for ${Math.round(timeSinceUpdate/1000)}s, resubscribing...`);
+                            resubscribeSymbol(marketId, symbol);
+                        }
+                    }
+                });
+                
+                // Check overall connection health
                 if (now - lighterLastActivity > 10000) {
                     console.warn('Lighter WebSocket inactive for 10s, reconnecting...');
                     lighterWs.close();
@@ -624,7 +713,7 @@
                 let binance = binanceData[symbol] || {};
                 
                 // Use last valid Binance data if current data is unavailable but recent
-                const MAX_AGE = 30000; // 30 seconds
+                const MAX_AGE = 60000; // 60 seconds for better persistence
                 if ((!binance.bid || !binance.ask) && lastValidBinanceData[symbol]) {
                     const age = Date.now() - lastValidBinanceData[symbol].timestamp;
                     if (age < MAX_AGE) {
