@@ -349,59 +349,110 @@
         
         // Connect to Lighter WebSocket
         function connectLighter() {
-            // Clean up existing connection
-            if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
-                lighterWs.close();
+            // Clean up existing connection properly
+            if (lighterWs) {
+                if (lighterWs.readyState === WebSocket.OPEN || lighterWs.readyState === WebSocket.CONNECTING) {
+                    console.log('Closing existing Lighter WebSocket...');
+                    lighterWs.close();
+                }
+                lighterWs = null;
+            }
+            
+            // Check if markets are loaded
+            if (Object.keys(lighterMarkets).length === 0) {
+                console.log('No Lighter markets loaded yet, waiting...');
+                setTimeout(connectLighter, 3000);
+                return;
             }
             
             console.log(`Attempting to connect to Lighter WebSocket... (attempt ${lighterReconnectAttempts + 1})`);
-            lighterWs = new WebSocket('wss://mainnet.zklighter.elliot.ai/stream');
+            
+            try {
+                lighterWs = new WebSocket('wss://mainnet.zklighter.elliot.ai/stream');
+            } catch (error) {
+                console.error('Failed to create WebSocket connection:', error);
+                lighterReconnectAttempts++;
+                const delay = Math.min(2000 * Math.pow(1.5, lighterReconnectAttempts), 15000);
+                setTimeout(connectLighter, delay);
+                return;
+            }
             
             lighterWs.onopen = () => {
                 console.log('✅ Connected to Lighter WebSocket');
                 lighterReconnectAttempts = 0; // Reset reconnection attempts
                 lighterLastActivity = Date.now();
                 
-                // Subscribe to all markets with staggered timing for stability
-                const marketIds = Object.keys(lighterMarkets);
-                let subscribeIndex = 0;
-                
-                const subscribeNext = () => {
-                    if (subscribeIndex >= marketIds.length) {
-                        console.log(`Subscribed to ${Object.keys(binanceSymbolMap).length} Binance-listed markets`);
+                // Add delay before starting subscriptions to ensure connection is stable
+                setTimeout(() => {
+                    if (lighterWs.readyState !== WebSocket.OPEN) {
+                        console.error('WebSocket closed before subscriptions could start');
                         return;
                     }
                     
-                    const marketId = marketIds[subscribeIndex];
-                    const symbol = lighterMarkets[marketId];
+                    // Subscribe to all markets with staggered timing for stability
+                    const marketIds = Object.keys(lighterMarkets);
+                    let subscribeIndex = 0;
+                    let successCount = 0;
+                    let failCount = 0;
+                    const failedSubscriptions = [];
                     
-                    if (binanceSymbolMap[symbol] && lighterWs.readyState === WebSocket.OPEN) {
-                        // Subscribe to orderbook updates
-                        lighterWs.send(JSON.stringify({
-                            type: 'subscribe',
-                            channel: `order_book/${marketId}`
-                        }));
+                    const subscribeNext = () => {
+                        if (subscribeIndex >= marketIds.length) {
+                            console.log(`Initial subscription complete: ${successCount} successful, ${failCount} failed`);
+                            
+                            // Retry failed subscriptions after a delay
+                            if (failedSubscriptions.length > 0) {
+                                console.log(`Retrying ${failedSubscriptions.length} failed subscriptions...`);
+                                setTimeout(() => retryFailedSubscriptions(failedSubscriptions), 2000);
+                            }
+                            
+                            // Start verification check after initial subscriptions
+                            setTimeout(verifySubscriptions, 5000);
+                            return;
+                        }
                         
-                        // Mark subscription time
-                        symbolSubscriptionStatus[symbol] = Date.now();
-                        symbolLastUpdate[symbol] = Date.now(); // Initialize last update time
+                        const marketId = marketIds[subscribeIndex];
+                        const symbol = lighterMarkets[marketId];
                         
-                        // Subscribe to market stats for funding rates with small delay
-                        setTimeout(() => {
-                            if (lighterWs.readyState === WebSocket.OPEN) {
+                        if (binanceSymbolMap[symbol] && lighterWs.readyState === WebSocket.OPEN) {
+                            try {
+                                // Subscribe to orderbook updates
                                 lighterWs.send(JSON.stringify({
                                     type: 'subscribe',
-                                    channel: `market_stats/${marketId}`
+                                    channel: `order_book/${marketId}`
                                 }));
+                                
+                                // Mark subscription time
+                                symbolSubscriptionStatus[symbol] = Date.now();
+                                symbolLastUpdate[symbol] = Date.now(); // Initialize last update time
+                                successCount++;
+                                
+                                // Subscribe to market stats for funding rates with small delay
+                                setTimeout(() => {
+                                    if (lighterWs.readyState === WebSocket.OPEN) {
+                                        try {
+                                            lighterWs.send(JSON.stringify({
+                                                type: 'subscribe',
+                                                channel: `market_stats/${marketId}`
+                                            }));
+                                        } catch (e) {
+                                            console.error(`Failed to subscribe to market_stats for ${symbol}:`, e);
+                                        }
+                                    }
+                                }, 25);
+                            } catch (error) {
+                                console.error(`Failed to subscribe to ${symbol}:`, error);
+                                failedSubscriptions.push({ marketId, symbol });
+                                failCount++;
                             }
-                        }, 25);
-                    }
+                        }
+                        
+                        subscribeIndex++;
+                        setTimeout(subscribeNext, 50); // Stagger subscriptions by 50ms
+                    };
                     
-                    subscribeIndex++;
-                    setTimeout(subscribeNext, 50); // Stagger subscriptions by 50ms
-                };
-                
-                subscribeNext();
+                    subscribeNext();
+                }, 500); // Wait 500ms after connection before starting subscriptions
             };
             
             lighterWs.onmessage = (event) => {
@@ -507,22 +558,97 @@
             if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
                 console.log(`Resubscribing to ${symbol} (market ${marketId})`);
                 
-                // Unsubscribe first
-                lighterWs.send(JSON.stringify({
-                    type: 'unsubscribe',
-                    channel: `order_book/${marketId}`
-                }));
-                
-                // Resubscribe after short delay
+                try {
+                    // Unsubscribe first
+                    lighterWs.send(JSON.stringify({
+                        type: 'unsubscribe',
+                        channel: `order_book/${marketId}`
+                    }));
+                    
+                    // Resubscribe after short delay
+                    setTimeout(() => {
+                        if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
+                            try {
+                                lighterWs.send(JSON.stringify({
+                                    type: 'subscribe',
+                                    channel: `order_book/${marketId}`
+                                }));
+                                symbolSubscriptionStatus[symbol] = Date.now();
+                            } catch (e) {
+                                console.error(`Failed to resubscribe to ${symbol}:`, e);
+                            }
+                        }
+                    }, 100);
+                } catch (error) {
+                    console.error(`Failed to unsubscribe from ${symbol}:`, error);
+                }
+            }
+        }
+        
+        // Function to retry failed subscriptions
+        function retryFailedSubscriptions(failedList) {
+            if (!lighterWs || lighterWs.readyState !== WebSocket.OPEN) {
+                console.warn('Cannot retry subscriptions - WebSocket not connected');
+                return;
+            }
+            
+            failedList.forEach(({ marketId, symbol }, index) => {
                 setTimeout(() => {
                     if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
-                        lighterWs.send(JSON.stringify({
-                            type: 'subscribe',
-                            channel: `order_book/${marketId}`
-                        }));
-                        symbolSubscriptionStatus[symbol] = Date.now();
+                        console.log(`Retrying subscription for ${symbol}`);
+                        try {
+                            lighterWs.send(JSON.stringify({
+                                type: 'subscribe',
+                                channel: `order_book/${marketId}`
+                            }));
+                            symbolSubscriptionStatus[symbol] = Date.now();
+                            symbolLastUpdate[symbol] = Date.now();
+                            
+                            // Also subscribe to market stats
+                            setTimeout(() => {
+                                if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
+                                    try {
+                                        lighterWs.send(JSON.stringify({
+                                            type: 'subscribe',
+                                            channel: `market_stats/${marketId}`
+                                        }));
+                                    } catch (e) {
+                                        console.error(`Failed to subscribe to market_stats for ${symbol}:`, e);
+                                    }
+                                }
+                            }, 50);
+                        } catch (e) {
+                            console.error(`Retry failed for ${symbol}:`, e);
+                        }
                     }
-                }, 100);
+                }, index * 100); // Stagger retries
+            });
+        }
+        
+        // Function to verify all subscriptions are working
+        function verifySubscriptions() {
+            if (!lighterWs || lighterWs.readyState !== WebSocket.OPEN) return;
+            
+            const now = Date.now();
+            const needsResubscribe = [];
+            
+            Object.keys(lighterMarkets).forEach(marketId => {
+                const symbol = lighterMarkets[marketId];
+                if (!binanceSymbolMap[symbol]) return;
+                
+                const lastUpdate = symbolLastUpdate[symbol] || 0;
+                const timeSinceUpdate = now - lastUpdate;
+                
+                // If no data received within 5 seconds of subscription, resubscribe
+                if (timeSinceUpdate > 5000) {
+                    console.warn(`${symbol} has not received data after subscription, will resubscribe`);
+                    needsResubscribe.push({ marketId, symbol });
+                }
+            });
+            
+            if (needsResubscribe.length > 0) {
+                console.log(`Resubscribing to ${needsResubscribe.length} symbols that haven't received data`);
+                retryFailedSubscriptions(needsResubscribe);
             }
         }
         
@@ -882,11 +1008,49 @@
 
         // Initialize
         async function init() {
-            await fetchLighterMarkets(); // Get Lighter markets first
-            await fetchBinanceFundingIntervals(); // Then get funding intervals for those symbols
-            connectLighter();
-            setTimeout(connectBinance, 1000);
-            setupSorting();
+            console.log('Starting initialization sequence...');
+            
+            try {
+                // Get Lighter markets first
+                console.log('Step 1: Fetching Lighter markets...');
+                await fetchLighterMarkets();
+                
+                if (Object.keys(lighterMarkets).length === 0) {
+                    console.error('No Lighter markets loaded, retrying in 3 seconds...');
+                    setTimeout(init, 3000);
+                    return;
+                }
+                
+                // Then get funding intervals for those symbols
+                console.log('Step 2: Fetching Binance funding intervals...');
+                await fetchBinanceFundingIntervals();
+                
+                // Add delay to ensure everything is properly initialized
+                console.log('Step 3: Waiting for initialization to settle...');
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                
+                // Connect to WebSockets with defensive checks
+                console.log('Step 4: Connecting to Lighter WebSocket...');
+                connectLighter();
+                
+                console.log('Step 5: Connecting to Binance WebSocket in 2 seconds...');
+                setTimeout(() => {
+                    if (Object.keys(binanceSymbolMap).length > 0) {
+                        connectBinance();
+                    } else {
+                        console.error('No Binance symbols mapped, skipping Binance connection');
+                    }
+                }, 2000);
+                
+                console.log('Step 6: Setting up UI interactions...');
+                setupSorting();
+                
+                console.log('Initialization complete!');
+            } catch (error) {
+                console.error('Initialization failed:', error);
+                console.log('Retrying initialization in 5 seconds...');
+                setTimeout(init, 5000);
+            }
         }
 
         document.addEventListener('DOMContentLoaded', () => {
