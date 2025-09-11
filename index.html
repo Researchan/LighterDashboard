@@ -258,6 +258,50 @@
         let binanceFundingIntervals = {};
         let binanceListedSymbols = new Set(); // Track which symbols are actually listed on Binance
         
+        // Fetch Lighter funding rates via REST API as fallback
+        async function fetchLighterFundingRates() {
+            try {
+                const response = await fetch('https://mainnet.zklighter.elliot.ai/api/v1/orderBooks');
+                const data = await response.json();
+                
+                if (data.code === 200 && data.order_books) {
+                    let updatedCount = 0;
+                    data.order_books.forEach(market => {
+                        const symbol = market.symbol;
+                        if (binanceSymbolMap[symbol] && market.funding_rate !== undefined) {
+                            // Only update if we don't have recent WebSocket data
+                            const lastUpdate = symbolLastFundingUpdate[symbol] || 0;
+                            if (Date.now() - lastUpdate > 30000) { // If no update for 30 seconds
+                                const fundingRate = parseFloat(market.funding_rate || 0);
+                                lighterFundingData[symbol] = fundingRate * 8; // Convert to 8h
+                                updatedCount++;
+                                console.log(`Updated ${symbol} funding via REST API: ${fundingRate}`);
+                            }
+                        }
+                    });
+                    if (updatedCount > 0) {
+                        console.log(`Updated ${updatedCount} symbols via REST API fallback`);
+                        scheduleUpdate();
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to fetch Lighter funding rates via REST:', error);
+            }
+        }
+        
+        // Periodically fetch funding rates via REST as fallback
+        setInterval(() => {
+            // Check for symbols without funding data
+            const symbolsWithoutFunding = Object.keys(binanceSymbolMap).filter(symbol => 
+                !lighterFundingData[symbol] || lighterFundingData[symbol] === 0
+            );
+            
+            if (symbolsWithoutFunding.length > 0) {
+                console.log(`${symbolsWithoutFunding.length} symbols without funding data, fetching via REST...`);
+                fetchLighterFundingRates();
+            }
+        }, 30000); // Check every 30 seconds
+        
         // Fetch actual funding intervals from Binance fundingInfo API
         async function fetchBinanceFundingIntervals() {
             try {
@@ -437,8 +481,8 @@
                                                 channel: `market_stats/${marketId}`
                                             }));
                                             
-                                            // Log subscription for problematic symbols
-                                            if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                            // Log subscription for first-time symbols
+                                            if (!symbolLastFundingUpdate[symbol]) {
                                                 console.log(`Subscribed to market_stats for ${symbol} (market ${marketId})`);
                                             }
                                         } catch (e) {
@@ -524,45 +568,68 @@
                     
                     if (symbol && binanceSymbolMap[symbol]) {
                         if (data.market_stats) {
-                            const fundingRate = parseFloat(data.market_stats.current_funding_rate || 0);
-                            
-                            // Log funding data for debugging specific symbols
-                            if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
-                                console.log(`Funding data for ${symbol}:`, {
-                                    raw_data: data.market_stats,
-                                    current_funding_rate: data.market_stats.current_funding_rate,
-                                    parsed_rate: fundingRate,
-                                    calculated_8h: fundingRate * 8
-                                });
+                            // Log all market_stats data to understand structure
+                            if (!symbolLastFundingUpdate[symbol]) {
+                                console.log(`First market_stats data for ${symbol}:`, data.market_stats);
                             }
                             
-                            // Check if funding rate is actually provided
-                            if (data.market_stats.current_funding_rate !== undefined && data.market_stats.current_funding_rate !== null) {
+                            // Try to find funding rate in various possible fields
+                            let fundingRate = null;
+                            let source = null;
+                            
+                            // Check all possible field names
+                            const possibleFields = [
+                                'current_funding_rate',
+                                'funding_rate',
+                                'next_funding_rate',
+                                'fundingRate',
+                                'currentFundingRate',
+                                'nextFundingRate',
+                                'rate',
+                                'funding',
+                                'current_rate'
+                            ];
+                            
+                            for (const field of possibleFields) {
+                                if (data.market_stats[field] !== undefined && data.market_stats[field] !== null) {
+                                    fundingRate = parseFloat(data.market_stats[field]);
+                                    source = field;
+                                    break;
+                                }
+                            }
+                            
+                            // If still no funding rate, check nested objects
+                            if (fundingRate === null) {
+                                if (data.market_stats.funding && typeof data.market_stats.funding === 'object') {
+                                    if (data.market_stats.funding.rate !== undefined) {
+                                        fundingRate = parseFloat(data.market_stats.funding.rate);
+                                        source = 'funding.rate';
+                                    } else if (data.market_stats.funding.current !== undefined) {
+                                        fundingRate = parseFloat(data.market_stats.funding.current);
+                                        source = 'funding.current';
+                                    }
+                                }
+                            }
+                            
+                            if (fundingRate !== null && !isNaN(fundingRate)) {
                                 lighterFundingData[symbol] = fundingRate * 8; // Convert 1h to 8h
                                 symbolLastFundingUpdate[symbol] = Date.now();
+                                
+                                // Log successful funding rate extraction for previously problematic symbols
+                                if (!symbolLastFundingUpdate[symbol] || Date.now() - symbolLastFundingUpdate[symbol] > 60000) {
+                                    console.log(`Funding rate found for ${symbol}: ${fundingRate} from field '${source}'`);
+                                }
                             } else {
-                                // Try alternative field names
-                                if (data.market_stats.funding_rate !== undefined) {
-                                    const altFundingRate = parseFloat(data.market_stats.funding_rate || 0);
-                                    lighterFundingData[symbol] = altFundingRate * 8;
-                                    symbolLastFundingUpdate[symbol] = Date.now();
-                                    if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
-                                        console.log(`Using alternative funding_rate field for ${symbol}: ${altFundingRate}`);
-                                    }
-                                } else if (data.market_stats.next_funding_rate !== undefined) {
-                                    // Try next_funding_rate as fallback
-                                    const nextFundingRate = parseFloat(data.market_stats.next_funding_rate || 0);
-                                    lighterFundingData[symbol] = nextFundingRate * 8;
-                                    symbolLastFundingUpdate[symbol] = Date.now();
-                                    if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
-                                        console.log(`Using next_funding_rate field for ${symbol}: ${nextFundingRate}`);
-                                    }
-                                } else {
-                                    console.warn(`No funding rate data for ${symbol}`, data.market_stats);
-                                    // Keep existing value if we had one
-                                    if (!lighterFundingData[symbol]) {
-                                        lighterFundingData[symbol] = 0; // Default to 0 if never received
-                                    }
+                                // Log when we can't find funding rate
+                                const now = Date.now();
+                                const lastLog = symbolLastFundingUpdate[symbol] || 0;
+                                if (now - lastLog > 30000) { // Log every 30 seconds max
+                                    console.warn(`No funding rate found for ${symbol} in:`, Object.keys(data.market_stats));
+                                }
+                                
+                                // Keep existing value or default to 0
+                                if (!lighterFundingData[symbol]) {
+                                    lighterFundingData[symbol] = 0;
                                 }
                             }
                             
@@ -641,8 +708,9 @@
                                                     type: 'subscribe',
                                                     channel: `market_stats/${marketId}`
                                                 }));
-                                                if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
-                                                    console.log(`Resubscribed to market_stats for ${symbol}`);
+                                                // Log resubscription for symbols without funding data
+                                                if (!lighterFundingData[symbol] || lighterFundingData[symbol] === 0) {
+                                                    console.log(`Resubscribed to market_stats for ${symbol} (no funding data yet)`);
                                                 }
                                             } catch (e) {
                                                 console.error(`Failed to resubscribe to market_stats for ${symbol}:`, e);
@@ -1101,15 +1169,19 @@
                 console.log('Step 2: Fetching Binance funding intervals...');
                 await fetchBinanceFundingIntervals();
                 
+                // Fetch initial Lighter funding rates via REST
+                console.log('Step 3: Fetching initial Lighter funding rates...');
+                await fetchLighterFundingRates();
+                
                 // Add delay to ensure everything is properly initialized
-                console.log('Step 3: Waiting for initialization to settle...');
+                console.log('Step 4: Waiting for initialization to settle...');
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 
                 // Connect to WebSockets with defensive checks
-                console.log('Step 4: Connecting to Lighter WebSocket...');
+                console.log('Step 5: Connecting to Lighter WebSocket...');
                 connectLighter();
                 
-                console.log('Step 5: Connecting to Binance WebSocket in 2 seconds...');
+                console.log('Step 6: Connecting to Binance WebSocket in 2 seconds...');
                 setTimeout(() => {
                     if (Object.keys(binanceSymbolMap).length > 0) {
                         connectBinance();
@@ -1118,7 +1190,7 @@
                     }
                 }, 2000);
                 
-                console.log('Step 6: Setting up UI interactions...');
+                console.log('Step 7: Setting up UI interactions...');
                 setupSorting();
                 
                 console.log('Initialization complete!');
