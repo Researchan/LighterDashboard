@@ -132,6 +132,7 @@
         const lastValidBinanceData = {}; // Store last valid Binance data
         const symbolLastUpdate = {}; // Track last update time for each symbol
         const symbolSubscriptionStatus = {}; // Track subscription status per symbol
+        const symbolLastFundingUpdate = {}; // Track last funding update time per symbol
         let lighterMarkets = {};
         let binanceSymbolMap = {};
         
@@ -435,6 +436,11 @@
                                                 type: 'subscribe',
                                                 channel: `market_stats/${marketId}`
                                             }));
+                                            
+                                            // Log subscription for problematic symbols
+                                            if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                                console.log(`Subscribed to market_stats for ${symbol} (market ${marketId})`);
+                                            }
                                         } catch (e) {
                                             console.error(`Failed to subscribe to market_stats for ${symbol}:`, e);
                                         }
@@ -516,11 +522,54 @@
                     const marketId = parseInt(data.channel.split(':')[1]);
                     const symbol = lighterMarkets[marketId];
                     
-                    if (symbol && binanceSymbolMap[symbol] && data.market_stats) {
-                        const fundingRate = parseFloat(data.market_stats.current_funding_rate || 0);
-                        lighterFundingData[symbol] = fundingRate * 8; // Convert 1h to 8h
-                        
-                        scheduleUpdate();
+                    if (symbol && binanceSymbolMap[symbol]) {
+                        if (data.market_stats) {
+                            const fundingRate = parseFloat(data.market_stats.current_funding_rate || 0);
+                            
+                            // Log funding data for debugging specific symbols
+                            if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                console.log(`Funding data for ${symbol}:`, {
+                                    raw_data: data.market_stats,
+                                    current_funding_rate: data.market_stats.current_funding_rate,
+                                    parsed_rate: fundingRate,
+                                    calculated_8h: fundingRate * 8
+                                });
+                            }
+                            
+                            // Check if funding rate is actually provided
+                            if (data.market_stats.current_funding_rate !== undefined && data.market_stats.current_funding_rate !== null) {
+                                lighterFundingData[symbol] = fundingRate * 8; // Convert 1h to 8h
+                                symbolLastFundingUpdate[symbol] = Date.now();
+                            } else {
+                                // Try alternative field names
+                                if (data.market_stats.funding_rate !== undefined) {
+                                    const altFundingRate = parseFloat(data.market_stats.funding_rate || 0);
+                                    lighterFundingData[symbol] = altFundingRate * 8;
+                                    symbolLastFundingUpdate[symbol] = Date.now();
+                                    if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                        console.log(`Using alternative funding_rate field for ${symbol}: ${altFundingRate}`);
+                                    }
+                                } else if (data.market_stats.next_funding_rate !== undefined) {
+                                    // Try next_funding_rate as fallback
+                                    const nextFundingRate = parseFloat(data.market_stats.next_funding_rate || 0);
+                                    lighterFundingData[symbol] = nextFundingRate * 8;
+                                    symbolLastFundingUpdate[symbol] = Date.now();
+                                    if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                        console.log(`Using next_funding_rate field for ${symbol}: ${nextFundingRate}`);
+                                    }
+                                } else {
+                                    console.warn(`No funding rate data for ${symbol}`, data.market_stats);
+                                    // Keep existing value if we had one
+                                    if (!lighterFundingData[symbol]) {
+                                        lighterFundingData[symbol] = 0; // Default to 0 if never received
+                                    }
+                                }
+                            }
+                            
+                            scheduleUpdate();
+                        } else {
+                            console.warn(`Empty market_stats for ${symbol}`);
+                        }
                     }
                 }
             };
@@ -554,7 +603,7 @@
         }
         
         // Function to resubscribe to a specific symbol
-        function resubscribeSymbol(marketId, symbol) {
+        function resubscribeSymbol(marketId, symbol, includeMarketStats = true) {
             if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
                 console.log(`Resubscribing to ${symbol} (market ${marketId})`);
                 
@@ -565,15 +614,42 @@
                         channel: `order_book/${marketId}`
                     }));
                     
+                    if (includeMarketStats) {
+                        lighterWs.send(JSON.stringify({
+                            type: 'unsubscribe',
+                            channel: `market_stats/${marketId}`
+                        }));
+                    }
+                    
                     // Resubscribe after short delay
                     setTimeout(() => {
                         if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
                             try {
+                                // Resubscribe to orderbook
                                 lighterWs.send(JSON.stringify({
                                     type: 'subscribe',
                                     channel: `order_book/${marketId}`
                                 }));
                                 symbolSubscriptionStatus[symbol] = Date.now();
+                                
+                                // Also resubscribe to market_stats
+                                if (includeMarketStats) {
+                                    setTimeout(() => {
+                                        if (lighterWs && lighterWs.readyState === WebSocket.OPEN) {
+                                            try {
+                                                lighterWs.send(JSON.stringify({
+                                                    type: 'subscribe',
+                                                    channel: `market_stats/${marketId}`
+                                                }));
+                                                if (['NMT', 'DOLO', 'PYTH'].includes(symbol)) {
+                                                    console.log(`Resubscribed to market_stats for ${symbol}`);
+                                                }
+                                            } catch (e) {
+                                                console.error(`Failed to resubscribe to market_stats for ${symbol}:`, e);
+                                            }
+                                        }
+                                    }, 50);
+                                }
                             } catch (e) {
                                 console.error(`Failed to resubscribe to ${symbol}:`, e);
                             }
