@@ -75,10 +75,26 @@
         tr:nth-child(even) { 
             background: #f8fafc; 
         }
-        tr:hover { 
-            background: #e0e7ff; 
+        tr:hover {
+            background: #e0e7ff;
             transform: translateY(-1px);
             transition: all 0.2s ease;
+        }
+        .star-icon {
+            cursor: pointer;
+            font-size: 27px;
+            padding-right: 8px;
+            transition: color 0.2s;
+            user-select: none;
+        }
+        .star-icon:hover {
+            transform: scale(1.1);
+        }
+        .star-icon.favorite {
+            color: #fbbf24;
+        }
+        .star-icon:not(.favorite) {
+            color: #d1d5db;
         }
         .update-time { 
             text-align: center; 
@@ -95,9 +111,40 @@
             .container { padding: 15px; }
             th, td { padding: 12px 8px; font-size: 12px; }
         }
+        .search-container {
+            position: absolute;
+            top: 20px;
+            right: 40px;
+            z-index: 100;
+        }
+        .search-input {
+            padding: 8px 16px;
+            border-radius: 20px;
+            border: 2px solid #e0e7ff;
+            background: white;
+            font-size: 14px;
+            width: 200px;
+            outline: none;
+            transition: all 0.3s;
+        }
+        .search-input:focus {
+            border-color: #7c3aed;
+            box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1);
+            width: 250px;
+        }
+        .search-input::placeholder {
+            color: #9ca3af;
+        }
     </style>
 </head>
 <body>
+    <div class="search-container">
+        <input type="text"
+               class="search-input"
+               id="searchInput"
+               placeholder="Search symbol..."
+               autocomplete="off">
+    </div>
     <div class="container">
         <div class="table-container">
             <table>
@@ -966,6 +1013,23 @@
         let sortColumn = 'fundingDiff';
         let sortDirection = 'desc';
 
+        // Favorites management
+        let favorites = JSON.parse(localStorage.getItem('fundingArbitrageFavorites') || '[]');
+
+        // Search functionality
+        let searchQuery = '';
+
+        function toggleFavorite(symbol) {
+            const index = favorites.indexOf(symbol);
+            if (index > -1) {
+                favorites.splice(index, 1);
+            } else {
+                favorites.push(symbol);
+            }
+            localStorage.setItem('fundingArbitrageFavorites', JSON.stringify(favorites));
+            updateTable();
+        }
+
         // Update table
         function updateTable() {
             const tbody = document.getElementById('tableBody');
@@ -973,10 +1037,15 @@
             
             Object.keys(lighterMarkets).forEach(marketId => {
                 const symbol = lighterMarkets[marketId];
-                
+
                 // Skip if not listed on Binance
                 if (!binanceSymbolMap[symbol]) {
                     return; // Skip unlisted pairs
+                }
+
+                // Filter by search query
+                if (searchQuery && !symbol.toLowerCase().includes(searchQuery.toLowerCase())) {
+                    return; // Skip if doesn't match search
                 }
                 
                 const lighter = getBestPrices(symbol);
@@ -1040,8 +1109,17 @@
                 });
             });
             
-            // Sort rows
+            // Sort rows - favorites first, then by selected column
             rows.sort((a, b) => {
+                // Check if either is a favorite
+                const aIsFavorite = favorites.includes(a.symbol);
+                const bIsFavorite = favorites.includes(b.symbol);
+
+                // Favorites always come first
+                if (aIsFavorite && !bIsFavorite) return -1;
+                if (!aIsFavorite && bIsFavorite) return 1;
+
+                // If both are favorites or both are not, sort by column
                 let aVal = a[sortColumn] || 0;
                 let bVal = b[sortColumn] || 0;
                 
@@ -1100,9 +1178,18 @@
                 // Add visual indicator for missing data
                 const rowClass = row.hasValidData ? '' : 'opacity: 0.6;';
                 
+                const isFavorite = favorites.includes(row.symbol);
+
                 return `
                 <tr style="${rowClass}">
-                    <td><strong>${row.symbol}</strong></td>
+                    <td>
+                        <span class="star-icon ${isFavorite ? 'favorite' : ''}"
+                              onclick="toggleFavorite('${row.symbol}')"
+                              title="${isFavorite ? 'Remove from favorites' : 'Add to favorites'}">
+                            ${isFavorite ? '★' : '☆'}
+                        </span>
+                        <strong>${row.symbol}</strong>
+                    </td>
                     <td>${row.lighterFunding.toFixed(6)}%</td>
                     <td title="Raw funding rate per ${intervalDisplay} interval">
                         ${isFinite(row.binanceFunding) ? row.binanceFunding.toFixed(6) : 'N/A'}% 
@@ -1150,6 +1237,26 @@
             });
         }
 
+        // Setup search functionality
+        function setupSearch() {
+            const searchInput = document.getElementById('searchInput');
+            if (searchInput) {
+                searchInput.addEventListener('input', (e) => {
+                    searchQuery = e.target.value;
+                    updateTable();
+                });
+
+                // Clear search on Escape key
+                searchInput.addEventListener('keydown', (e) => {
+                    if (e.key === 'Escape') {
+                        searchInput.value = '';
+                        searchQuery = '';
+                        updateTable();
+                    }
+                });
+            }
+        }
+
         // Initialize
         async function init() {
             console.log('Starting initialization sequence...');
@@ -1192,7 +1299,8 @@
                 
                 console.log('Step 7: Setting up UI interactions...');
                 setupSorting();
-                
+                setupSearch();
+
                 console.log('Initialization complete!');
             } catch (error) {
                 console.error('Initialization failed:', error);
