@@ -135,6 +135,31 @@
         .search-input::placeholder {
             color: #9ca3af;
         }
+        .compare-container-inline {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+            padding: 15px;
+            background: linear-gradient(135deg, rgba(79, 70, 229, 0.05), rgba(124, 58, 237, 0.05));
+            border-radius: 15px;
+            border: 2px solid #e0e7ff;
+        }
+        .exchange-select {
+            padding: 8px 16px;
+            border-radius: 20px;
+            border: 2px solid #e0e7ff;
+            background: white;
+            font-size: 14px;
+            outline: none;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+        }
+        .exchange-select:focus {
+            border-color: #7c3aed;
+            box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1);
+        }
     </style>
 </head>
 <body>
@@ -146,18 +171,31 @@
                autocomplete="off">
     </div>
     <div class="container">
+        <div class="compare-container-inline">
+            <label style="font-weight: 600; margin-right: 10px; color: #4f46e5;">Compare:</label>
+            <select id="exchangeA" class="exchange-select">
+                <option value="lighter">Lighter</option>
+                <option value="binance" selected>Binance</option>
+                <option value="aster">AsterDEX</option>
+            </select>
+            <span style="margin: 0 10px; font-weight: 600; color: #4f46e5;">vs</span>
+            <select id="exchangeB" class="exchange-select">
+                <option value="lighter" selected>Lighter</option>
+                <option value="binance">Binance</option>
+                <option value="aster">AsterDEX</option>
+            </select>
+        </div>
         <div class="table-container">
             <table>
                 <thead>
                     <tr>
                         <th>Symbol</th>
                         <th class="sortable" data-sort="lighterFunding">Lighter (8h) ↕</th>
-                        <th class="sortable" data-sort="binanceFunding">Binance (Interval) ↕</th>
                         <th class="sortable" data-sort="binanceFunding8h">Binance (8h eq) ↕</th>
+                        <th class="sortable" data-sort="asterFunding8h">AsterDEX (8h eq) ↕</th>
                         <th class="sortable" data-sort="fundingDiff">Diff (8h) ↕</th>
-                        <th>Next Funding</th>
-                        <th>L Bid / B Ask</th>
-                        <th>L Ask / B Bid</th>
+                        <th>Bid / Ask</th>
+                        <th>Ask / Bid</th>
                     </tr>
                 </thead>
                 <tbody id="tableBody">
@@ -174,14 +212,21 @@
         // Complete orderbook state management
         const lighterOrderbooks = {}; // {symbol: {bids: Map, asks: Map}}
         const binanceData = {};
+        const asterData = {};
         const lighterFundingData = {};
         const lastValidLighterData = {}; // Store last valid Lighter orderbook data
         const lastValidBinanceData = {}; // Store last valid Binance data
+        const lastValidAsterData = {}; // Store last valid Aster orderbook data
         const symbolLastUpdate = {}; // Track last update time for each symbol
         const symbolSubscriptionStatus = {}; // Track subscription status per symbol
         const symbolLastFundingUpdate = {}; // Track last funding update time per symbol
         let lighterMarkets = {};
         let binanceSymbolMap = {};
+        let asterSymbolMap = {};
+
+        // Exchange comparison state
+        let selectedExchangeA = 'binance';
+        let selectedExchangeB = 'lighter';
         
         // Throttled update mechanism
         let updateTimeout = null;
@@ -413,7 +458,7 @@
                     data.order_books.forEach(market => {
                         if (market.status === 'active') {
                             lighterMarkets[market.market_id] = market.symbol;
-                            
+
                             // Create Binance symbol mapping
                             let binanceSymbol;
                             if (market.symbol === 'XPL') {
@@ -424,6 +469,9 @@
                                 binanceSymbol = market.symbol + 'USDT';
                             }
                             binanceSymbolMap[market.symbol] = binanceSymbol;
+
+                            // Create AsterDEX symbol mapping (same as Binance)
+                            asterSymbolMap[market.symbol] = binanceSymbol;
                         }
                     });
                     
@@ -1009,6 +1057,161 @@
             }
         }, 3000); // Check every 3 seconds for faster recovery
 
+        // AsterDEX WebSocket state
+        let asterWs = null;
+        let asterReconnectAttempts = 0;
+        let asterLastActivity = Date.now();
+        let asterFundingIntervals = {};
+
+        // Fetch AsterDEX funding intervals
+        async function fetchAsterFundingIntervals() {
+            try {
+                console.log('Fetching AsterDEX funding intervals from fundingInfo API...');
+
+                const response = await fetch('https://fapi.asterdex.com/fapi/v1/fundingInfo');
+                const data = await response.json();
+
+                if (Array.isArray(data)) {
+                    let intervalCounts = { 1: 0, 4: 0, 8: 0 };
+
+                    data.forEach(item => {
+                        const symbol = item.symbol;
+                        const fundingInterval = item.fundingIntervalHours;
+
+                        if (symbol && fundingInterval) {
+                            asterFundingIntervals[symbol] = fundingInterval;
+                            intervalCounts[fundingInterval] = (intervalCounts[fundingInterval] || 0) + 1;
+                        }
+                    });
+
+                    console.log(`AsterDEX loaded funding intervals: ${intervalCounts[1] || 0} symbols with 1h, ${intervalCounts[4] || 0} symbols with 4h, ${intervalCounts[8] || 0} symbols with 8h`);
+                }
+            } catch (error) {
+                console.error('Error fetching AsterDEX funding intervals:', error);
+            }
+        }
+
+        // Connect to AsterDEX WebSocket
+        function connectAster() {
+            // Clean up existing connection
+            if (asterWs && asterWs.readyState === WebSocket.OPEN) {
+                asterWs.close();
+            }
+
+            const symbols = Object.values(asterSymbolMap)
+                .map(s => s.toLowerCase())
+                .filter(s => s.includes('usdt'));
+
+            if (symbols.length === 0) {
+                console.log('No AsterDEX symbols to connect to, waiting...');
+                setTimeout(connectAster, 5000);
+                return;
+            }
+
+            const streams = [];
+            symbols.forEach(symbol => {
+                streams.push(`${symbol}@depth5@100ms`);
+                streams.push(`${symbol}@markPrice@1s`);
+            });
+
+            const streamUrl = `wss://fstream.asterdex.com/stream?streams=${streams.join('/')}`;
+            console.log(`Connecting to AsterDEX WebSocket... (attempt ${asterReconnectAttempts + 1})`);
+            asterWs = new WebSocket(streamUrl);
+
+            asterWs.onopen = () => {
+                console.log(`✅ Connected to AsterDEX WebSocket with ${symbols.length} symbols`);
+                asterReconnectAttempts = 0;
+                asterLastActivity = Date.now();
+            };
+
+            asterWs.onmessage = (event) => {
+                asterLastActivity = Date.now();
+                const msg = JSON.parse(event.data);
+
+                if (msg.stream && msg.data) {
+                    const data = msg.data;
+                    const symbol = data.s;
+
+                    let lighterSymbol = null;
+                    for (const [ls, as] of Object.entries(asterSymbolMap)) {
+                        if (as === symbol) {
+                            lighterSymbol = ls;
+                            break;
+                        }
+                    }
+
+                    if (lighterSymbol) {
+                        if (!asterData[lighterSymbol]) asterData[lighterSymbol] = {};
+
+                        if (msg.stream.includes('depth')) {
+                            if (data.b && data.b.length > 0) {
+                                asterData[lighterSymbol].bid = parseFloat(data.b[0][0]);
+                            }
+                            if (data.a && data.a.length > 0) {
+                                asterData[lighterSymbol].ask = parseFloat(data.a[0][0]);
+                            }
+
+                            // Validate and store Aster data
+                            if (asterData[lighterSymbol].bid > 0 && asterData[lighterSymbol].ask > 0 &&
+                                asterData[lighterSymbol].ask > asterData[lighterSymbol].bid) {
+                                lastValidAsterData[lighterSymbol] = {
+                                    ...asterData[lighterSymbol],
+                                    timestamp: Date.now()
+                                };
+                            }
+
+                            scheduleUpdate();
+
+                        } else if (msg.stream.includes('markPrice')) {
+                            const currentFundingRate = parseFloat(data.r || 0) * 100; // Convert to percentage
+                            const nextFundingTime = parseInt(data.T || 0);
+
+                            // Get funding interval
+                            const asterSymbol = asterSymbolMap[lighterSymbol];
+                            let fundingInterval = asterFundingIntervals[asterSymbol] || 8;
+
+                            // Store raw funding rate and calculated interval
+                            asterData[lighterSymbol].rawFundingRate = currentFundingRate;
+                            asterData[lighterSymbol].fundingInterval = fundingInterval;
+                            asterData[lighterSymbol].nextFundingTime = nextFundingTime;
+
+                            // Convert to 8h equivalent
+                            let multiplier = 8 / fundingInterval;
+                            asterData[lighterSymbol].funding8h = currentFundingRate * multiplier;
+
+                            scheduleUpdate();
+                        }
+                    }
+                }
+            };
+
+            asterWs.onerror = (error) => {
+                console.error('❌ AsterDEX WebSocket error:', error);
+            };
+
+            asterWs.onclose = (event) => {
+                console.log('❌ AsterDEX WebSocket closed. Code:', event.code);
+                asterReconnectAttempts++;
+                const delay = Math.min(1000 * Math.pow(1.5, asterReconnectAttempts), 10000);
+                console.log(`Reconnecting in ${delay/1000} seconds...`);
+                setTimeout(connectAster, delay);
+            };
+        }
+
+        // Monitor AsterDEX WebSocket health
+        setInterval(() => {
+            const now = Date.now();
+            if (asterWs && asterWs.readyState === WebSocket.OPEN) {
+                if (now - asterLastActivity > 10000) {
+                    console.warn('AsterDEX WebSocket inactive for 10s, reconnecting...');
+                    asterWs.close();
+                }
+            } else if (!asterWs || asterWs.readyState === WebSocket.CLOSED) {
+                console.warn('AsterDEX WebSocket is closed, attempting reconnect...');
+                connectAster();
+            }
+        }, 3000);
+
         // Sorting state
         let sortColumn = 'fundingDiff';
         let sortDirection = 'desc';
@@ -1050,8 +1253,9 @@
                 
                 const lighter = getBestPrices(symbol);
                 let binance = binanceData[symbol] || {};
-                
-                // Use last valid Binance data if current data is unavailable but recent
+                let aster = asterData[symbol] || {};
+
+                // Use last valid data if current data is unavailable but recent
                 const MAX_AGE = 60000; // 60 seconds for better persistence
                 if ((!binance.bid || !binance.ask) && lastValidBinanceData[symbol]) {
                     const age = Date.now() - lastValidBinanceData[symbol].timestamp;
@@ -1063,49 +1267,90 @@
                         };
                     }
                 }
-                
+                if ((!aster.bid || !aster.ask) && lastValidAsterData[symbol]) {
+                    const age = Date.now() - lastValidAsterData[symbol].timestamp;
+                    if (age < MAX_AGE) {
+                        aster = {
+                            ...aster,
+                            bid: aster.bid || lastValidAsterData[symbol].bid,
+                            ask: aster.ask || lastValidAsterData[symbol].ask
+                        };
+                    }
+                }
+
+                // Get all funding rates
                 const lighterFunding = lighterFundingData[symbol] || 0;
                 const binanceFunding8hEquiv = binance.funding8h || 0;
-                const fundingDiff = lighterFunding - binanceFunding8hEquiv;
-                
-                // Calculate ratios only if we have valid prices, otherwise show N/A
-                let lBidBAskRatio = null;
-                let lAskBBidRatio = null;
-                
-                const hasValidLighterPrices = lighter.bid > 0 && lighter.ask > 0 && lighter.ask > lighter.bid;
-                const hasValidBinancePrices = binance.bid > 0 && binance.ask > 0 && binance.ask > binance.bid;
-                
-                if (hasValidLighterPrices && hasValidBinancePrices) {
-                    lBidBAskRatio = lighter.bid / binance.ask;
-                    lAskBBidRatio = lighter.ask / binance.bid;
+                const asterFunding8hEquiv = aster.funding8h || 0;
+
+                // Helper function to get exchange data
+                const getExchangeData = (exchangeName) => {
+                    switch(exchangeName) {
+                        case 'lighter':
+                            return {
+                                bid: lighter.bid,
+                                ask: lighter.ask,
+                                funding: lighterFunding,
+                                rawFunding: lighterFunding,
+                                fundingInterval: 8
+                            };
+                        case 'binance':
+                            return {
+                                bid: binance.bid,
+                                ask: binance.ask,
+                                funding: binanceFunding8hEquiv,
+                                rawFunding: binance.rawFundingRate || 0,
+                                fundingInterval: binance.fundingInterval || 8
+                            };
+                        case 'aster':
+                            return {
+                                bid: aster.bid,
+                                ask: aster.ask,
+                                funding: asterFunding8hEquiv,
+                                rawFunding: aster.rawFundingRate || 0,
+                                fundingInterval: aster.fundingInterval || 8
+                            };
+                        default:
+                            return null;
+                    }
+                };
+
+                // Get selected exchange data
+                const exchangeAData = getExchangeData(selectedExchangeA);
+                const exchangeBData = getExchangeData(selectedExchangeB);
+
+                // Calculate diff and ratios based on selected exchanges
+                const fundingDiff = exchangeAData.funding - exchangeBData.funding;
+
+                let bidAskRatio = null;
+                let askBidRatio = null;
+
+                const hasValidAData = exchangeAData.bid > 0 && exchangeAData.ask > 0 && exchangeAData.ask > exchangeAData.bid;
+                const hasValidBData = exchangeBData.bid > 0 && exchangeBData.ask > 0 && exchangeBData.ask > exchangeBData.bid;
+
+                if (hasValidAData && hasValidBData) {
+                    bidAskRatio = exchangeAData.bid / exchangeBData.ask;
+                    askBidRatio = exchangeAData.ask / exchangeBData.bid;
                 }
-                
-                // Calculate funding countdown
-                const now = Date.now();
-                const nextFundingTime = binance.nextFundingTime || 0;
-                const fundingCountdown = nextFundingTime ? Math.max(0, Math.floor((nextFundingTime - now) / 1000)) : 0;
-                
-                // Get raw funding data from Binance
-                const rawBinanceFunding = binance.rawFundingRate || 0;
-                const fundingInterval = binance.fundingInterval || 8;
-                
+
                 // Always show the row, even with partial data
                 rows.push({
                     symbol,
                     lighterFunding,
-                    binanceFunding: rawBinanceFunding, // Show raw rate
-                    binanceFunding8h: binanceFunding8hEquiv, // 8h equivalent for comparison
-                    fundingInterval,
+                    binanceFunding8h: binanceFunding8hEquiv,
+                    binanceFundingInterval: binance.fundingInterval || 8,
+                    binanceRawFunding: binance.rawFundingRate || 0,
+                    asterFunding8h: asterFunding8hEquiv,
+                    asterFundingInterval: aster.fundingInterval || 8,
+                    asterRawFunding: aster.rawFundingRate || 0,
                     fundingDiff,
-                    lighterBid: lighter.bid,
-                    lighterAsk: lighter.ask,
-                    binanceBid: binance.bid,
-                    binanceAsk: binance.ask,
-                    lBidBAskRatio,
-                    lAskBBidRatio,
-                    hasValidData: hasValidLighterPrices && hasValidBinancePrices,
-                    nextFundingTime,
-                    fundingCountdown
+                    exchangeABid: exchangeAData.bid,
+                    exchangeAAsk: exchangeAData.ask,
+                    exchangeBBid: exchangeBData.bid,
+                    exchangeBAsk: exchangeBData.ask,
+                    bidAskRatio,
+                    askBidRatio,
+                    hasValidData: hasValidAData && hasValidBData
                 });
             });
             
@@ -1134,51 +1379,47 @@
             
             // Build table HTML
             tbody.innerHTML = rows.map(row => {
-                const lBidBAskColor = row.lBidBAskRatio !== null ? 
-                    (row.lBidBAskRatio < 1 ? 'positive' : row.lBidBAskRatio > 1 ? 'negative' : 'neutral') : 'neutral';
-                const lAskBBidColor = row.lAskBBidRatio !== null ? 
-                    (row.lAskBBidRatio > 1 ? 'positive' : row.lAskBBidRatio < 1 ? 'negative' : 'neutral') : 'neutral';
-                
+                const bidAskColor = row.bidAskRatio !== null ?
+                    (row.bidAskRatio < 1 ? 'positive' : row.bidAskRatio > 1 ? 'negative' : 'neutral') : 'neutral';
+                const askBidColor = row.askBidRatio !== null ?
+                    (row.askBidRatio > 1 ? 'positive' : row.askBidRatio < 1 ? 'negative' : 'neutral') : 'neutral';
+
                 // Format prices and ratios with fallbacks and infinity checks
-                const lighterBidStr = row.lighterBid ? row.lighterBid.toFixed(6) : 'N/A';
-                const lighterAskStr = row.lighterAsk ? row.lighterAsk.toFixed(6) : 'N/A';
-                const binanceBidStr = row.binanceBid ? row.binanceBid.toFixed(6) : 'N/A';
-                const binanceAskStr = row.binanceAsk ? row.binanceAsk.toFixed(6) : 'N/A';
-                
+                const exchangeABidStr = row.exchangeABid ? row.exchangeABid.toFixed(6) : 'N/A';
+                const exchangeAAskStr = row.exchangeAAsk ? row.exchangeAAsk.toFixed(6) : 'N/A';
+                const exchangeBBidStr = row.exchangeBBid ? row.exchangeBBid.toFixed(6) : 'N/A';
+                const exchangeBAskStr = row.exchangeBAsk ? row.exchangeBAsk.toFixed(6) : 'N/A';
+
                 // Handle infinity and null values for ratios
-                const lBidBAskStr = (row.lBidBAskRatio !== null && isFinite(row.lBidBAskRatio)) ? 
-                    row.lBidBAskRatio.toFixed(5) : 'N/A';
-                const lAskBBidStr = (row.lAskBBidRatio !== null && isFinite(row.lAskBBidRatio)) ? 
-                    row.lAskBBidRatio.toFixed(5) : 'N/A';
-                
-                // Format funding countdown
-                const formatCountdown = (seconds) => {
-                    if (!seconds) return 'N/A';
-                    const hours = Math.floor(seconds / 3600);
-                    const minutes = Math.floor((seconds % 3600) / 60);
-                    const secs = seconds % 60;
-                    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                const bidAskStr = (row.bidAskRatio !== null && isFinite(row.bidAskRatio)) ?
+                    row.bidAskRatio.toFixed(5) : 'N/A';
+                const askBidStr = (row.askBidRatio !== null && isFinite(row.askBidRatio)) ?
+                    row.askBidRatio.toFixed(5) : 'N/A';
+
+                // Format funding interval display with color coding for each exchange
+                const formatFundingDisplay = (funding8h, interval, rawFunding) => {
+                    let intervalDisplay = `${interval}h`;
+                    let intervalColor = '';
+                    if (interval === 1) {
+                        intervalColor = 'color: #dc2626; font-weight: bold;'; // Red for 1h
+                    } else if (interval === 4) {
+                        intervalColor = 'color: #d97706; font-weight: bold;'; // Orange for 4h
+                    } else {
+                        intervalColor = 'color: #059669;'; // Green for 8h
+                    }
+
+                    return `${isFinite(funding8h) ? funding8h.toFixed(6) : 'N/A'}%
+                        <span style="${intervalColor}">(${intervalDisplay})</span>`;
                 };
-                
-                const countdownStr = formatCountdown(row.fundingCountdown);
-                const nextFundingStr = row.nextFundingTime ? 
-                    new Date(row.nextFundingTime).toLocaleTimeString('en-US', { hour12: false }) : 'N/A';
-                    
-                // Format funding interval display with color coding
-                let intervalDisplay = `${row.fundingInterval}h`;
-                let intervalColor = '';
-                if (row.fundingInterval === 1) {
-                    intervalColor = 'color: #dc2626; font-weight: bold;'; // Red for 1h
-                } else if (row.fundingInterval === 4) {
-                    intervalColor = 'color: #d97706; font-weight: bold;'; // Orange for 4h
-                } else {
-                    intervalColor = 'color: #059669;'; // Green for 8h
-                }
-                
+
                 // Add visual indicator for missing data
                 const rowClass = row.hasValidData ? '' : 'opacity: 0.6;';
-                
+
                 const isFavorite = favorites.includes(row.symbol);
+
+                // Get exchange names in title case
+                const exchangeAName = selectedExchangeA.charAt(0).toUpperCase() + selectedExchangeA.slice(1);
+                const exchangeBName = selectedExchangeB.charAt(0).toUpperCase() + selectedExchangeB.slice(1);
 
                 return `
                 <tr style="${rowClass}">
@@ -1191,24 +1432,20 @@
                         <strong>${row.symbol}</strong>
                     </td>
                     <td>${row.lighterFunding.toFixed(6)}%</td>
-                    <td title="Raw funding rate per ${intervalDisplay} interval">
-                        ${isFinite(row.binanceFunding) ? row.binanceFunding.toFixed(6) : 'N/A'}% 
-                        <span style="${intervalColor}">(${intervalDisplay})</span>
+                    <td title="8-hour equivalent for comparison">
+                        ${formatFundingDisplay(row.binanceFunding8h, row.binanceFundingInterval, row.binanceRawFunding)}
                     </td>
                     <td title="8-hour equivalent for comparison">
-                        ${isFinite(row.binanceFunding8h) ? row.binanceFunding8h.toFixed(6) : 'N/A'}%
+                        ${formatFundingDisplay(row.asterFunding8h, row.asterFundingInterval, row.asterRawFunding)}
                     </td>
                     <td class="${row.fundingDiff > 0 ? 'positive' : row.fundingDiff < 0 ? 'negative' : 'neutral'}">
                         ${isFinite(row.fundingDiff) ? (row.fundingDiff > 0 ? '+' : '') + row.fundingDiff.toFixed(6) + '%' : 'N/A'}
                     </td>
-                    <td class="neutral" title="Next funding at ${nextFundingStr}" style="font-size: 12px;">
-                        ${countdownStr}
+                    <td class="${bidAskColor}" title="${exchangeAName} Bid: ${exchangeABidStr} / ${exchangeBName} Ask: ${exchangeBAskStr}">
+                        ${bidAskStr}
                     </td>
-                    <td class="${lBidBAskColor}" title="L Bid: ${lighterBidStr} / B Ask: ${binanceAskStr}">
-                        ${lBidBAskStr}
-                    </td>
-                    <td class="${lAskBBidColor}" title="L Ask: ${lighterAskStr} / B Bid: ${binanceBidStr}">
-                        ${lAskBBidStr}
+                    <td class="${askBidColor}" title="${exchangeAName} Ask: ${exchangeAAskStr} / ${exchangeBName} Bid: ${exchangeBBidStr}">
+                        ${askBidStr}
                     </td>
                 </tr>`;
             }).join('');
@@ -1257,6 +1494,44 @@
             }
         }
 
+        // Setup exchange comparison selectors
+        function setupExchangeSelectors() {
+            const exchangeASelect = document.getElementById('exchangeA');
+            const exchangeBSelect = document.getElementById('exchangeB');
+
+            if (exchangeASelect) {
+                exchangeASelect.addEventListener('change', (e) => {
+                    const newValue = e.target.value;
+                    // If same exchange selected, swap them
+                    if (newValue === selectedExchangeB) {
+                        const temp = selectedExchangeA;
+                        selectedExchangeA = newValue;
+                        selectedExchangeB = temp;
+                        exchangeBSelect.value = temp;
+                    } else {
+                        selectedExchangeA = newValue;
+                    }
+                    updateTable();
+                });
+            }
+
+            if (exchangeBSelect) {
+                exchangeBSelect.addEventListener('change', (e) => {
+                    const newValue = e.target.value;
+                    // If same exchange selected, swap them
+                    if (newValue === selectedExchangeA) {
+                        const temp = selectedExchangeB;
+                        selectedExchangeB = newValue;
+                        selectedExchangeA = temp;
+                        exchangeASelect.value = temp;
+                    } else {
+                        selectedExchangeB = newValue;
+                    }
+                    updateTable();
+                });
+            }
+        }
+
         // Initialize
         async function init() {
             console.log('Starting initialization sequence...');
@@ -1297,9 +1572,22 @@
                     }
                 }, 2000);
                 
-                console.log('Step 7: Setting up UI interactions...');
+                console.log('Step 7: Fetching AsterDEX funding intervals...');
+                await fetchAsterFundingIntervals();
+
+                console.log('Step 8: Connecting to AsterDEX WebSocket in 3 seconds...');
+                setTimeout(() => {
+                    if (Object.keys(asterSymbolMap).length > 0) {
+                        connectAster();
+                    } else {
+                        console.error('No AsterDEX symbols mapped, skipping AsterDEX connection');
+                    }
+                }, 3000);
+
+                console.log('Step 9: Setting up UI interactions...');
                 setupSorting();
                 setupSearch();
+                setupExchangeSelectors();
 
                 console.log('Initialization complete!');
             } catch (error) {
